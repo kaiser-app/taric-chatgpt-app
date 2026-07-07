@@ -1,57 +1,76 @@
-import { calculateCustoms, findSeedClassification } from '../../shared/calculator.js';
+import { DEFAULTS, SEED_RULES } from './catalog.js';
 
-const json = (statusCode, body) => ({
-  statusCode,
-  headers: {
-    'content-type': 'application/json; charset=utf-8',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET,POST,OPTIONS',
-    'access-control-allow-headers': 'content-type'
-  },
-  body: JSON.stringify(body, null, 2)
-});
-
-function parseBody(event) {
-  if (event.httpMethod === 'GET') {
-    const q = event.queryStringParameters || {};
-    return {
-      productName: q.productName || q.q || '',
-      description: q.description || '',
-      valueHuf: Number(q.valueHuf || 100000),
-      currencyRateHufPerEur: Number(q.rate || q.currencyRateHufPerEur || 400),
-      declarationLines: Number(q.lines || q.declarationLines || 1),
-      flow: q.flow || 'b2c',
-      vatScheme: q.vatScheme || 'ioss',
-      procedure: q.procedure || 'H7',
-      preferentialTreatment: q.preferentialTreatment === 'true'
-    };
-  }
-  return event.body ? JSON.parse(event.body) : {};
+export function normalizeText(value) {
+return String(value || '')
+.toLowerCase()
+.normalize('NFD')
+.replace(/[\u0300-\u036f]/g, '')
+.trim();
 }
 
-export async function handler(event) {
-  if (event.httpMethod === 'OPTIONS') return json(200, { ok: true });
-  if (!['GET', 'POST'].includes(event.httpMethod)) return json(405, { error: 'Method not allowed' });
+export function findSeedClassification(productName, description = '') {
+const haystack = normalizeText(`${productName} ${description}`);
+const hit = SEED_RULES.find((rule) => rule.match.some((m) => haystack.includes(normalizeText(m))));
+if (hit) return { ...hit, source: 'seed-catalog' };
+return {
+code: null,
+title: 'Nincs biztos seed-találat; TARIC/NAV lookup szükséges',
+hs6: null,
+dutyPct: null,
+vatPct: 27,
+restrictions: [],
+confidence: 'alacsony',
+source: 'fallback'
+};
+}
 
-  try {
-    const input = parseBody(event);
-    if (!input.productName || !String(input.productName).trim()) {
-      return json(400, { error: 'productName kötelező' });
-    }
-    const classification = findSeedClassification(input.productName, input.description);
-    const result = calculateCustoms({ ...input, classification });
-    return json(200, {
-      ok: true,
-      input,
-      ...result,
-      links: {
-        euTaric: result.classification.code
-          ? `https://ec.europa.eu/taxation_customs/dds2/taric/taric_consultation.jsp?Lang=hu&Taric=${result.classification.code}`
-          : null,
-        navTaric: 'https://kkk.nav.gov.hu/eles/1/taricweb/'
-      }
-    });
-  } catch (error) {
-    return json(500, { error: error.message || 'Internal error' });
-  }
+export function calculateCustoms(input) {
+const params = { ...DEFAULTS, ...input };
+const valueHuf = Number(params.valueHuf || 0);
+const rate = Number(params.currencyRateHufPerEur || DEFAULTS.currencyRateHufPerEur);
+const lines = Math.max(1, Number.parseInt(params.declarationLines || 1, 10));
+const classification = input.classification || findSeedClassification(input.productName, input.description);
+const vatPct = Number(classification.vatPct ?? params.vatRatePct ?? DEFAULTS.vatRatePct);
+const dutyPct = Number(classification.dutyPct ?? 0);
+const lowValueLimitHuf = 150 * rate;
+const isLowValueB2C = params.flow === 'b2c' && valueHuf > 0 && valueHuf < lowValueLimitHuf;
+const hasRestrictions = Array.isArray(classification.restrictions) && classification.restrictions.length > 0;
+const canUseFlatDuty = isLowValueB2C && !hasRestrictions;
+const flatDutyHuf = 3 * lines * rate;
+const normalDutyHuf = valueHuf * dutyPct / 100;
+const dutyHuf = canUseFlatDuty
+? (params.preferentialTreatment ? 0 : flatDutyHuf)
+: normalDutyHuf;
+const iossVatExempt = canUseFlatDuty && params.vatScheme === 'ioss';
+const vatBaseHuf = valueHuf + dutyHuf;
+const vatHuf = iossVatExempt ? 0 : vatBaseHuf * vatPct / 100;
+return {
+classification,
+assumptions: {
+rate,
+valueHuf,
+lowValueLimitHuf,
+lines,
+flow: params.flow,
+procedure: params.procedure,
+vatScheme: params.vatScheme,
+preferentialTreatment: Boolean(params.preferentialTreatment),
+isLowValueB2C,
+hasRestrictions,
+canUseFlatDuty,
+iossVatExempt
+},
+amounts: {
+normalDutyHuf: Math.round(normalDutyHuf),
+flatDutyHuf: Math.round(flatDutyHuf),
+appliedDutyHuf: Math.round(dutyHuf),
+vatHuf: Math.round(vatHuf),
+totalPublicChargeHuf: Math.round(dutyHuf + vatHuf)
+},
+notes: [
+'A seed-katalógus csak prototípus. Éles rendszerben NAV/EU TARIC HTML lookup szükséges.',
+'A 3 EUR átalányvám logika csak kisértékű B2C, 150 EUR alatti, korlátozásmentes esetre alkalmazható.',
+'A válasz nem eKTF és nem hivatalos NAV állásfoglalás.'
+]
+};
 }
